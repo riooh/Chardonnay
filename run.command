@@ -8,16 +8,21 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 # inside a generated Merlot app.
 RUN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-WINE_VERSION="${WINE_VERSION:-11.10}"
-DXMT_VERSION="${DXMT_VERSION:-0.74}"
+WINE_VERSION="${WINE_VERSION:-11.18}"
+DXMT_VERSION="${DXMT_VERSION:-0.80}"
 
 WINE_ROOT="${WINE_ROOT:-$HOME/wine-${WINE_VERSION}}"
 WINE_APP="${WINE_ROOT}/Wine Staging.app"
 WINE_BIN="${WINE_APP}/Contents/Resources/wine/bin/wine"
+WINE_LIB="${WINE_APP}/Contents/Resources/wine/lib/wine"
 
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine-steam-11}"
 STEAM_SETUP="/tmp/SteamSetup.exe"
 DXMT_ROOT="${DXMT_ROOT:-$HOME/DXMT}"
+# Source for the winemac.so patch set (macdrv_functions export for DXMT).
+NEUTRON_DIR="${NEUTRON_DIR:-$HOME/neutron-clone}"
+# Build output directory for the patched winemac.so rebuild.
+DXMT_BUILD_OUT="${DXMT_BUILD_OUT:-$HOME/wine-dxmt-build}"
 # GPTK_PATH: optional. When set, the D3D translation backend switches from
 # DXMT (default) to Apple's Game Porting Toolkit (D3DMetal). Point this at
 # either the GPTK root directory or the folder that contains the .dll files
@@ -36,6 +41,13 @@ MERLOT_STEAM_LOG="${MERLOT_STEAM_LOG:-${TMPDIR:-/tmp}/merlot-steam.log}"
 # 1=install and deploy the steamwebhelper wrapper that fixes it (Default).
 # 0=skip it (expect a black Steam window). See wrapper/README.md.
 MERLOT_CEF_WRAPPER="${MERLOT_CEF_WRAPPER:-1}"
+# Gcenx Wine builds ignore WINEDLLPATH_PREPEND, so on those builds DXMT never
+# loads from DXMT_ROOT alone: the payload has to be installed into the Wine
+# tree and prefix (wiki layout), and winemac.so has to export the macdrv_*
+# symbols DXMT dlsyms to create Metal surfaces.
+# 1=install and verify all of that after the DXMT download step (Default).
+# 0=skip (not recommended: D3D11 games fall back to wined3d/OpenGL).
+MERLOT_DXMT_FIX="${MERLOT_DXMT_FIX:-1}"
 # Flags passed to steam.exe. -noverifyfiles is required: without it Steam's
 # boot-time checksum pass restores Valve's steamwebhelper.exe over the wrapper
 # and the black window comes back. -no-cef-sandbox is needed because Chromium's
@@ -376,6 +388,181 @@ ensure_cef_wrapper() {
   echo "See wrapper/README.md, or set MERLOT_CEF_WRAPPER=0 to silence this."
 }
 
+# ---------------------------------------------------------------------------
+# DXMT enablement. WINEDLLPATH_PREPEND alone is a no-op on Gcenx builds, so
+# the payload is installed into the Wine tree and prefix per the official
+# DXMT wiki layout, and winemac.so is rebuilt to export the macdrv_*
+# symbols DXMT dlsyms for Metal surface creation. Everything below is
+# idempotent and re-verified on every launch, so a Wine version update that
+# overwrites the patched files simply gets repaired on the next start.
+# ---------------------------------------------------------------------------
+
+# Populates DXMT_STATE_ISSUES and returns 0 when the stack is healthy.
+dxmt_stack_state() {
+  DXMT_STATE_ISSUES=()
+  local ok=0
+
+  [[ -d "${WINE_LIB}/x86_64-windows" ]] \
+    || { DXMT_STATE_ISSUES+=("Wine tree not found at ${WINE_LIB}"); ok=1; }
+  [[ -f "${DXMT_ROOT}/x86_64-windows/d3d11.dll" ]] \
+    || { DXMT_STATE_ISSUES+=("DXMT payload missing at ${DXMT_ROOT}"); ok=1; }
+
+  if [[ -d "${WINE_LIB}/x86_64-windows" && -f "${DXMT_ROOT}/x86_64-windows/d3d11.dll" ]]; then
+    cmp -s "${DXMT_ROOT}/x86_64-windows/d3d11.dll" "${WINE_LIB}/x86_64-windows/d3d11.dll" 2>/dev/null \
+      || { DXMT_STATE_ISSUES+=("Wine tree d3d11.dll is not DXMT (builtin wined3d fallback active)"); ok=1; }
+    cmp -s "${DXMT_ROOT}/x86_64-windows/dxgi.dll" "${WINE_LIB}/x86_64-windows/dxgi.dll" 2>/dev/null \
+      || { DXMT_STATE_ISSUES+=("Wine tree dxgi.dll is not DXMT"); ok=1; }
+    nm -gU "${WINE_LIB}/x86_64-unix/winemac.so" 2>/dev/null | grep -q "_macdrv_functions$" \
+      || { DXMT_STATE_ISSUES+=("winemac.so lacks the macdrv_functions export (DXMT cannot present frames)"); ok=1; }
+    [[ -f "${WINE_LIB}/x86_64-unix/winemetal.so" ]] \
+      || { DXMT_STATE_ISSUES+=("winemetal.so missing from the Wine tree"); ok=1; }
+  fi
+
+  [[ -s "${WINEPREFIX}/drive_c/windows/system32/winemetal.dll" ]] 2>/dev/null \
+    || { DXMT_STATE_ISSUES+=("prefix system32 missing winemetal.dll (${WINEPREFIX})"); ok=1; }
+
+  return "${ok}"
+}
+
+dxmt_install_payload() {
+  log "Installing DXMT DLLs into the Wine tree and prefix"
+  local f s32
+  for f in d3d11 dxgi d3d10core winemetal; do
+    if [[ -f "${WINE_LIB}/x86_64-windows/${f}.dll" && ! -f "${WINE_LIB}/x86_64-windows/${f}.dll.orig-wine" ]]; then
+      cp "${WINE_LIB}/x86_64-windows/${f}.dll" "${WINE_LIB}/x86_64-windows/${f}.dll.orig-wine"
+    fi
+    [[ -f "${DXMT_ROOT}/x86_64-windows/${f}.dll" ]] \
+      && cp "${DXMT_ROOT}/x86_64-windows/${f}.dll" "${WINE_LIB}/x86_64-windows/${f}.dll"
+  done
+  cp "${DXMT_ROOT}/x86_64-unix/winemetal.so" "${WINE_LIB}/x86_64-unix/winemetal.so"
+
+  s32="${WINEPREFIX}/drive_c/windows/system32"
+  for f in d3d11 dxgi d3d10core; do
+    if [[ -f "${s32}/${f}.dll" && ! -f "${s32}/${f}.dll.orig-wine" ]]; then
+      cp "${s32}/${f}.dll" "${s32}/${f}.dll.orig-wine"
+    fi
+    cp "${DXMT_ROOT}/x86_64-windows/${f}.dll" "${s32}/${f}.dll"
+  done
+  cp "${DXMT_ROOT}/x86_64-windows/winemetal.dll" "${s32}/winemetal.dll"
+  echo "DXMT payload installed (originals kept as *.orig-wine)."
+}
+
+dxmt_rebuild_winemac() {
+  log "Rebuilding winemac.so with the macdrv_functions export"
+  export PATH="/opt/homebrew/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:${PATH}"
+  command -v brew >/dev/null 2>&1 || die "Homebrew not found at /opt/homebrew (required to build winemac.so)"
+
+  local missing="" p
+  for p in bison flex mingw-w64; do
+    brew list --versions "$p" >/dev/null 2>&1 || missing="${missing} ${p}"
+  done
+  if [[ -n "${missing}" ]]; then
+    log "Installing build dependencies:${missing} (one-time)"
+    brew install ${missing} || die "brew install failed"
+  fi
+
+  if [[ ! -d "${NEUTRON_DIR}" ]]; then
+    log "Fetching the neutron winemac patch set"
+    git clone --depth 1 https://github.com/codeWonderland/neutron.git "${NEUTRON_DIR}" \
+      || die "neutron clone failed"
+  fi
+
+  rm -rf "${DXMT_BUILD_OUT}"
+  # The patch set rebuilds winemac.so against the installed Wine's source and
+  # also ships a Unity video fix (mfreadwrite) we deploy alongside.
+  sh "${NEUTRON_DIR}/tools/wine-dxmt/build.sh" "${WINE_ROOT}" "${DXMT_BUILD_OUT}" \
+    || die "winemac.so rebuild failed"
+
+  local live="${WINE_LIB}/x86_64-unix/winemac.so" arch
+  if [[ -f "${live}" && ! -f "${live}.orig" ]]; then
+    cp "${live}" "${live}.orig"
+  fi
+  cp "${DXMT_BUILD_OUT}/lib/wine/x86_64-unix/winemac.so" "${live}"
+  for arch in x86_64-windows i386-windows; do
+    [[ -f "${DXMT_BUILD_OUT}/lib/wine/${arch}/mfreadwrite.dll" ]] \
+      && cp "${DXMT_BUILD_OUT}/lib/wine/${arch}/mfreadwrite.dll" "${WINE_LIB}/${arch}/mfreadwrite.dll"
+  done
+  echo "winemac.so replaced (original kept as winemac.so.orig)."
+}
+
+# Steam app launches and per-game launchers can cold-start at the same time;
+# the rebuild and DLL copies must not interleave. mkdir is atomic on macOS.
+DXMT_LOCK_DIR="${TMPDIR:-/tmp}/merlot-dxmt.lock"
+dxmt_lock() {
+  if mkdir "${DXMT_LOCK_DIR}" 2>/dev/null; then
+    return 0
+  fi
+  echo "Another DXMT repair is in progress; waiting..."
+  local i
+  for i in $(seq 1 300); do
+    mkdir "${DXMT_LOCK_DIR}" 2>/dev/null && return 0
+    sleep 1
+  done
+  die "DXMT repair lock held for over 5 minutes: ${DXMT_LOCK_DIR}"
+}
+
+dxmt_unlock() {
+  rm -rf "${DXMT_LOCK_DIR}"
+}
+
+ensure_dxmt_fix() {
+  [[ "${MERLOT_DXMT_FIX}" == "0" || "${MERLOT_DXMT_FIX}" == "1" ]] \
+    || die "MERLOT_DXMT_FIX must be 0 or 1."
+
+  if [[ "${MERLOT_DXMT_FIX}" == "0" ]]; then
+    log "Skipping DXMT repair (MERLOT_DXMT_FIX=0)"
+    return
+  fi
+
+  if use_gptk; then
+    log "GPTK backend selected; skipping DXMT repair"
+    return
+  fi
+
+  [[ -d "${WINE_LIB}/x86_64-unix" ]] || die "Wine tree not found: ${WINE_LIB} (run the install first)"
+  [[ -f "${DXMT_ROOT}/x86_64-windows/d3d11.dll" ]] || die "DXMT payload missing at ${DXMT_ROOT} (run the install first)"
+  [[ -d "${WINEPREFIX}/drive_c" ]] || die "Wine prefix not initialized: ${WINEPREFIX}"
+  [[ -f "${DXMT_ROOT}/x86_64-unix/winemetal.so" ]] || die "winemetal.so missing from the DXMT payload at ${DXMT_ROOT}"
+
+  dxmt_lock
+  if ! cmp -s "${DXMT_ROOT}/x86_64-windows/d3d11.dll" "${WINE_LIB}/x86_64-windows/d3d11.dll" 2>/dev/null; then
+    dxmt_install_payload
+  else
+    echo "DXMT DLLs already installed in the Wine tree."
+  fi
+
+  if nm -gU "${WINE_LIB}/x86_64-unix/winemac.so" 2>/dev/null | grep -q "_macdrv_functions$"; then
+    echo "winemac.so already exports macdrv_functions."
+  else
+    dxmt_rebuild_winemac
+  fi
+  dxmt_unlock
+
+  if dxmt_stack_state; then
+    log "DXMT active: payload installed, macdrv_functions exported"
+  else
+    local issue
+    for issue in "${DXMT_STATE_ISSUES[@]}"; do
+      echo "Warning: ${issue}" >&2
+    done
+    echo "D3D11 games may fail to start. Re-run with ./run.command --check to inspect." >&2
+  fi
+}
+
+dxmt_check_mode() {
+  log "Checking the DXMT graphics stack"
+  if dxmt_stack_state; then
+    echo "OK: DXMT installed, winemac.so patched, prefix complete."
+    exit 0
+  fi
+  local issue
+  echo "Issues found:" >&2
+  for issue in "${DXMT_STATE_ISSUES[@]}"; do
+    echo "  - ${issue}" >&2
+  done
+  exit 2
+}
+
 purge_chromium_locks() {
   # A crashed Steam leaves Chromium singleton locks behind; the next launch then
   # trips the single-instance guard and falls back to --silent, with no window.
@@ -446,6 +633,7 @@ main() {
     enable_gptk_env
   else
     ensure_dxmt_installed
+    ensure_dxmt_fix
     enable_dxmt_env
   fi
   ensure_cef_wrapper
@@ -453,4 +641,15 @@ main() {
   launch_steam
 }
 
-main "$@"
+case "${1:-}" in
+  --check|--dxmt-check)
+    require_macos_arm64
+    dxmt_check_mode
+    ;;
+  "")
+    main "$@"
+    ;;
+  *)
+    die "Unknown argument: ${1} (supported: --check)"
+    ;;
+esac
