@@ -447,6 +447,18 @@ dxmt_install_payload() {
   echo "DXMT payload installed (originals kept as *.orig-wine)."
 }
 
+# neutron's build.sh expects the Wine build root that directly contains
+# bin/wine (Gcenx layout: "Wine Staging.app/Contents/Resources/wine").
+# WINE_ROOT is normally the version directory that contains the .app, so
+# resolve either shape before handing the path to the rebuild.
+dxmt_wine_build_root() {
+  if [[ -x "${WINE_ROOT}/bin/wine" ]]; then
+    printf '%s\n' "${WINE_ROOT}"
+  elif [[ -x "${WINE_APP}/Contents/Resources/wine/bin/wine" ]]; then
+    printf '%s\n' "${WINE_APP}/Contents/Resources/wine"
+  fi
+}
+
 dxmt_rebuild_winemac() {
   log "Rebuilding winemac.so with the macdrv_functions export"
   export PATH="/opt/homebrew/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:${PATH}"
@@ -468,9 +480,13 @@ dxmt_rebuild_winemac() {
   fi
 
   rm -rf "${DXMT_BUILD_OUT}"
+  local wine_build_root
+  wine_build_root="$(dxmt_wine_build_root)" || true
+  [[ -n "${wine_build_root}" ]] \
+    || die "Could not resolve the Wine build root (need bin/wine under ${WINE_ROOT} or ${WINE_APP})."
   # The patch set rebuilds winemac.so against the installed Wine's source and
   # also ships a Unity video fix (mfreadwrite) we deploy alongside.
-  sh "${NEUTRON_DIR}/tools/wine-dxmt/build.sh" "${WINE_ROOT}" "${DXMT_BUILD_OUT}" \
+  sh "${NEUTRON_DIR}/tools/wine-dxmt/build.sh" "${wine_build_root}" "${DXMT_BUILD_OUT}" \
     || die "winemac.so rebuild failed"
 
   local live="${WINE_LIB}/x86_64-unix/winemac.so" arch
@@ -487,15 +503,32 @@ dxmt_rebuild_winemac() {
 
 # Steam app launches and per-game launchers can cold-start at the same time;
 # the rebuild and DLL copies must not interleave. mkdir is atomic on macOS.
+# The lock records its holder's PID: a repair that dies (or is killed) leaves
+# the directory behind, and the next run reclaims it once the holder is gone
+# instead of waiting out the full timeout.
 DXMT_LOCK_DIR="${TMPDIR:-/tmp}/merlot-dxmt.lock"
 dxmt_lock() {
   if mkdir "${DXMT_LOCK_DIR}" 2>/dev/null; then
+    printf '%s\n' "$$" >"${DXMT_LOCK_DIR}/pid"
     return 0
+  fi
+  local holder
+  holder="$(cat "${DXMT_LOCK_DIR}/pid" 2>/dev/null || true)"
+  if [[ -z "${holder}" ]] || ! ps -p "${holder}" >/dev/null 2>&1; then
+    echo "Removing stale DXMT repair lock (holder ${holder:-unknown} no longer running)."
+    rm -rf "${DXMT_LOCK_DIR}"
+    if mkdir "${DXMT_LOCK_DIR}" 2>/dev/null; then
+      printf '%s\n' "$$" >"${DXMT_LOCK_DIR}/pid"
+      return 0
+    fi
   fi
   echo "Another DXMT repair is in progress; waiting..."
   local i
   for i in $(seq 1 300); do
-    mkdir "${DXMT_LOCK_DIR}" 2>/dev/null && return 0
+    if mkdir "${DXMT_LOCK_DIR}" 2>/dev/null; then
+      printf '%s\n' "$$" >"${DXMT_LOCK_DIR}/pid"
+      return 0
+    fi
     sleep 1
   done
   die "DXMT repair lock held for over 5 minutes: ${DXMT_LOCK_DIR}"
@@ -525,6 +558,8 @@ ensure_dxmt_fix() {
   [[ -f "${DXMT_ROOT}/x86_64-unix/winemetal.so" ]] || die "winemetal.so missing from the DXMT payload at ${DXMT_ROOT}"
 
   dxmt_lock
+  # Release the lock even when a step below fails (die exits the script).
+  trap 'dxmt_unlock' EXIT
   if ! cmp -s "${DXMT_ROOT}/x86_64-windows/d3d11.dll" "${WINE_LIB}/x86_64-windows/d3d11.dll" 2>/dev/null; then
     dxmt_install_payload
   else
@@ -537,6 +572,7 @@ ensure_dxmt_fix() {
     dxmt_rebuild_winemac
   fi
   dxmt_unlock
+  trap - EXIT
 
   if dxmt_stack_state; then
     log "DXMT active: payload installed, macdrv_functions exported"
