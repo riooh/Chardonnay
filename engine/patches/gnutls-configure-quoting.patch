@@ -1,0 +1,27 @@
+--- a/configure
++++ b/configure
+@@ -12437,7 +12437,7 @@
+ NETTLE_MINIMUM=3.6
+ 
+ 
+-    if test x$NETTLE_LIBS = x; then
++    if test "x$NETTLE_LIBS" = x; then
+ 	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for nettle_base64url_decode_init in -lnettle" >&5
+ printf %s "checking for nettle_base64url_decode_init in -lnettle... " >&6; }
+ if test ${ac_cv_lib_nettle_nettle_base64url_decode_init+y}
+@@ -12487,13 +12487,13 @@
+     fi
+ 
+ 
+-  if test x$NETTLE_LIBS != x; then
++  if test "x$NETTLE_LIBS" != x; then
+       cryptolib="nettle"
+   fi
+ 
+ 
+ 
+-    if test x$HOGWEED_LIBS = x; then
++    if test "x$HOGWEED_LIBS" = x; then
+ 	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for nettle_ed25519_sha512_verify in -lhogweed" >&5
+ printf %s "checking for nettle_ed25519_sha512_verify in -lhogweed... " >&6; }
+ if test ${ac_cv_lib_hogweed_nettle_ed25519_sha512_verify+y}

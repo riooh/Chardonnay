@@ -1,0 +1,2 @@
+# Unified-diff context blanks are meaningful; preserve their literal spaces.
+patches/*.patch -whitespace
