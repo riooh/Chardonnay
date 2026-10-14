@@ -1,0 +1,20 @@
+diff --git a/src/dmn_share_metal.mm b/src/dmn_share_metal.mm
+index 82bf248..f995d66 100644
+--- a/src/dmn_share_metal.mm
++++ b/src/dmn_share_metal.mm
+@@ -2104,8 +2104,14 @@ id swz_tex_new_view(id self, SEL _cmd, MTLPixelFormat fmt,
+                     MTLTextureType type, NSRange levels, NSRange slices,
+                     MTLTextureSwizzleChannels swz) {
+     id<MTLTexture> tex = (id<MTLTexture>)self;
++    /* Metal arrayLength counts cubes, while view ranges count individual
++     * faces. This swizzle also sees ordinary (non-impostor) cube textures. */
++    const MTLTextureType source_type = tex.textureType;
+     const NSUInteger have_slices =
+-        tex.textureType == MTLTextureType3D ? 1 : tex.arrayLength;
++        source_type == MTLTextureType3D ? 1 :
++        (source_type == MTLTextureTypeCube ||
++         source_type == MTLTextureTypeCubeArray) ? tex.arrayLength * 6 :
++        tex.arrayLength;
+     const NSUInteger have_levels = tex.mipmapLevelCount;
+ 
+     if (slices.location + slices.length > have_slices ||
