@@ -222,3 +222,84 @@ cp merlot_configs/template.conf.example merlot_configs/my-game.conf
 - `merlot_configs/*.conf` - per-game launcher metadata and `run.command` environment overrides
 - `merlot_configs/template.conf.example` - starting point for new game configs; not built by the script
 - `install_merlot.command` - assembles and installs the `Merlot Apps/` folder
+
+## Automatic Desktop apps for Wine programs
+
+`install_merlot.command --programs` imports Windows `.lnk` and `.url` shortcuts
+from registered prefixes into real native `.app` bundles on the Mac Desktop.
+It watches each prefix's private `Wine Shortcuts` / legacy `Steam Shortcuts`
+folders and its per-user/common Start Menu trees. A five-second polling loop
+catches installers that create Start Menu entries without a Desktop shortcut.
+Executables with no published shortcut are not guessed or auto-launched.
+
+Configuration lives at `~/.config/chardonnay-shortcuts/config.json`:
+
+```json
+{
+  "version": 1,
+  "output_dir": "/Users/you/Desktop",
+  "prefixes": [
+    {
+      "id": "main",
+      "name": "Main",
+      "path": "/absolute/path/to/prefix",
+      "wine": "/absolute/path/to/engine/bin/wine",
+      "environment": {"WINEDEBUG": "-all"}
+    }
+  ]
+}
+```
+
+Register each prefix with its actual engine and required graphics environment;
+never infer one engine for all bottles or import backup/diagnostic prefixes.
+Use `role: "merlot"` plus `repo` for the main Steam prefix so ordinary Steam
+and Steam game-URL launchers use the existing wrapper-aware `run.command`.
+`exclude_names` suppresses redundant clients in secondary prefixes; for example,
+keep one canonical Desktop Steam launcher instead of importing Steam twice.
+`prefer_plain_name: true` reclaims a plain generated name after a collision clears.
+
+```bash
+./install_merlot.command --programs watch
+./install_merlot.command --programs status
+./install_merlot.command --programs unwatch
+```
+
+`watch` builds `app/merlot/ShortcutInfo.c` with MinGW and the Cocoa GUI host
+`app/merlot/ShortcutAgent.m` with Xcode, creates `~/Applications/Wine Shortcuts.app`,
+and installs the Aqua launch agent `local.chardonnay.shortcuts.watch`. Approve
+its normal **Desktop folder** permission when macOS asks; rebuilding/signing the
+host can prompt again. It does not require Full Disk Access or launch Terminal.
+The existing `--games` watcher remains independent.
+
+The entrypoint is cached outside the signed host bundle at
+`~/.cache/chardonnay-shortcuts/entrypoint.command`; ordinary importer updates can
+replace that cache without changing the host's signature. `--programs unwatch`
+stops the owned worker and launch agent, retaining generated apps/configuration
+and the private Wine capture folders. The watcher starts again at the next login
+when enabled. `status.json`, `manifest.json`, and per-launch exit-status files are
+under `~/.cache/chardonnay-shortcuts/`.
+
+Safety and launch behavior:
+- Resolve `.lnk` metadata with `IShellLink`/`IPersistFile`; do not execute a program
+  merely to discover it. Wine's own `start /unix` opens the original link on click,
+  preserving its Windows arguments and working directory.
+- Keep the original shortcut out of the host Desktop using live Wine registry
+  writes, not edits to an active `user.reg`.
+- De-duplicate equivalent links within a prefix, but retain different argument
+  variants. Unmanaged user apps and symlinks are never overwritten.
+- Filter Start Menu maintenance/help entries. Extract icons as data from PE
+  resources or `.ico` files; use the bundled icon when extraction is unsupported.
+- Archive only owned stale launchers under `Retired/`; an incomplete/unreadable
+  scan does not remove existing apps. No user applications are deleted.
+- `target_overrides` may select a known bare-client launch policy by executable
+  basename (e.g. EA's in-process-GPU flags), independent of shortcut title.
+  Argument-bearing game links are never replaced with a bare-client command.
+- Test launchers belong in a private output directory. Any bounded Desktop
+  event-test fixtures must be removed before handing the workspace back.
+
+Regression tests:
+
+```bash
+python3 -m unittest discover -s tests -p test_program_shortcuts.py -v
+bash -n install_merlot.command
+```
