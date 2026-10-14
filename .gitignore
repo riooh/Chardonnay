@@ -3,3 +3,5 @@
 WINEPREFIX
 Merlot Apps/
 wrapper/steamwebhelper.exe
+__pycache__/
+*.py[cod]

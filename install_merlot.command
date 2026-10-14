@@ -435,6 +435,418 @@ games_main() {
   esac
 }
 
+# Generic shortcut import stays in this entrypoint; support sources live in app/merlot.
+programs_main() {
+  export PROGRAMS_SCRIPT_DIR="$SCRIPT_DIR"
+  export PROGRAMS_ENTRYPOINT="${PROGRAMS_ENTRYPOINT:-$SCRIPT_DIR/install_merlot.command}"
+  /usr/bin/python3 - "$@" <<'PROGRAMS_PY'
+# BEGIN PROGRAMS PYTHON
+import configparser
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+OWNER = 'local.chardonnay.shortcuts'
+HOME = Path.home()
+STATE = HOME / '.cache/chardonnay-shortcuts'
+CONFIG = Path(os.environ.get('PROGRAMS_CONFIG', str(HOME / '.config/chardonnay-shortcuts/config.json')))
+LABEL = OWNER + '.watch'
+AGENT = HOME / 'Applications/Wine Shortcuts.app'
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.new')
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    temp.replace(path)
+
+
+def host_path(path, profile):
+    path = str(path).strip('"')
+    if re.match(r'^[Cc]:[\\/]', path):
+        return Path(profile['path']) / 'drive_c' / path[3:].replace('\\', '/')
+    if re.match(r'^[A-Za-z]:[\\/]', path):
+        drive = Path(profile['path']) / 'dosdevices' / (path[0].lower() + ':')
+        return drive / path[3:].replace('\\', '/')
+    return Path(path) if path.startswith('/') else None
+
+
+def profile_env(profile):
+    env = dict(os.environ)
+    for key in ['WINEDLLPATH', 'WINEDLLPATH_PREPEND', 'WINELOADER', 'WINESERVER', 'WINEPREFIX', 'CX_ACTIVE_GRAPHICS_BACKEND', 'CX_APPLEGPTK_LIBD3DSHARED_PATH', 'CX_LIBVULKAN']:
+        env.pop(key, None)
+    env.update({'WINEPREFIX': profile['path'], 'WINEDEBUG': '-all', 'WINEDLLPATH': ''})
+    env.update(profile.get('environment', {}))
+    env['WINEPREFIX'] = profile['path']
+    return env
+
+
+def inspect_link(path, profile):
+    helper = os.environ.get('PROGRAMS_HELPER', str(STATE / 'ShortcutInfo.exe'))
+    winpath = 'Z:' + str(Path(path).absolute()).replace('/', '\\')
+    result = subprocess.run([profile['wine'], helper, winpath], env=profile_env(profile),
+                            capture_output=True, text=True, encoding='utf-8', timeout=25)
+    if result.returncode:
+        raise RuntimeError('shell-link inspector failed')
+    return json.loads(result.stdout.strip().lstrip('\ufeff'))
+
+
+def url_metadata(path):
+    data = Path(path).read_bytes()
+    text = data.decode('utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig', errors='replace')
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(text)
+    section = parser['InternetShortcut']
+    target = section.get('URL', '').strip()
+    scheme = target.partition(':')[0].lower()
+    if scheme not in {'steam', 'origin', 'origin2', 'ealink', 'com.epicgames.launcher', 'http', 'https'}:
+        raise ValueError('unsupported shortcut URL protocol')
+    return {'target': target, 'arguments': '', 'working_dir': '', 'icon': section.get('IconFile', ''), 'icon_index': int(section.get('IconIndex', '0'))}
+
+
+def safe_name(name):
+    name = re.sub(r'[\x00-\x1f/:]', '-', name).strip(' .')
+    while len(name.encode('utf-8')) > 150:
+        name = name[:-1]
+    return name or 'Wine Program'
+
+
+def pe_icon(path, index=0):
+    """Bounded RT_GROUP_ICON/RT_ICON extraction; never loads executable code."""
+    if Path(path).stat().st_size > 128*1024*1024: raise ValueError('icon source too large')
+    data = Path(path).read_bytes()
+    def u16(off): return struct.unpack_from('<H', data, off)[0]
+    def u32(off): return struct.unpack_from('<I', data, off)[0]
+    if data[:2] != b'MZ': raise ValueError('not PE')
+    pe = u32(0x3c)
+    if data[pe:pe+4] != b'PE\0\0': raise ValueError('not PE')
+    optional = pe + 24
+    directories = optional + (112 if u16(optional) == 0x20b else 96)
+    section_start = optional + u16(pe+20)
+    sections = []
+    for i in range(min(u16(pe+6), 96)):
+        off = section_start + i*40
+        sections.append((u32(off+12), max(u32(off+8), u32(off+16)), u32(off+20)))
+    def rva(value):
+        for start, length, raw in sections:
+            if start <= value < start+length: return raw + value-start
+        raise ValueError('unmapped PE resource')
+    base = rva(u32(directories+16))
+    def entries(relative):
+        off = base + relative
+        count = u16(off+12)+u16(off+14)
+        if count > 4096: raise ValueError('oversized resource directory')
+        return [(u32(off+16+i*8), u32(off+20+i*8)) for i in range(count)]
+    def payload(entry):
+        for _ in range(4):
+            if not entry & 0x80000000:
+                off = base+entry; start=rva(u32(off)); size=u32(off+4)
+                if size > 16*1024*1024 or start+size > len(data): raise ValueError('invalid resource size')
+                return data[start:start+size]
+            child = entries(entry & 0x7fffffff)
+            if not child: raise ValueError('empty resource directory')
+            entry = child[0][1]
+        raise ValueError('resource depth exceeded')
+    root = dict(entries(0))
+    groups = entries(root[14] & 0x7fffffff)
+    selected = next((value for ident, value in groups if index < 0 and ident == -index), None)
+    if selected is None: selected = groups[min(max(index, 0), len(groups)-1)][1]
+    group = payload(selected); count=struct.unpack_from('<H', group, 4)[0]
+    if not 0 < count <= 256 or len(group) < 6+14*count: raise ValueError('invalid group icon')
+    icons = dict(entries(root[3] & 0x7fffffff))
+    header = bytearray(struct.pack('<HHH', 0, 1, count)); blobs=[]; position=6+16*count
+    for i in range(count):
+        entry = group[6+14*i:20+14*i]; ident=struct.unpack_from('<H', entry, 12)[0]
+        blob = payload(icons[ident]); header.extend(entry[:8]+struct.pack('<II', len(blob), position)); blobs.append(blob); position+=len(blob)
+    return bytes(header)+b''.join(blobs)
+
+
+class Importer:
+    def __init__(self, config, state_dir=STATE, inspect=None):
+        self.config=config; self.state=Path(state_dir); self.output=Path(config.get('output_dir', str(HOME/'Desktop'))).expanduser()
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.inspect=inspect or inspect_link
+        path=self.state/'manifest.json'
+        self.manifest=json.loads(path.read_text()) if path.exists() else {'entries': {}, 'cache': {}}
+        self.complete=True
+
+    def roots(self, profile):
+        prefix=Path(profile['path']).expanduser()
+        if not (prefix/'drive_c').is_dir(): raise FileNotFoundError('registered prefix unavailable')
+        roots=[]
+        users=prefix/'drive_c/users'
+        for user in users.iterdir():
+            if user.is_symlink() or not user.is_dir() or user.name.lower() in {'public', 'all users', 'default'}: continue
+            for name in ['Wine Shortcuts', 'Steam Shortcuts', 'Desktop']:
+                directory=user/name
+                if not directory.is_symlink(): roots.append((directory, 'desktop'))
+            roots.append((user/'AppData/Roaming/Microsoft/Windows/Start Menu/Programs', 'start'))
+            roots.append((user/'Start Menu/Programs', 'start'))
+        roots.append((prefix/'drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs', 'start'))
+        return roots
+
+    def scan(self):
+        found=[]; self.complete=True
+        def failed(error): raise error
+        for profile in self.config['prefixes']:
+            for root, kind in self.roots(profile):
+                if not root.exists(): continue
+                for folder, dirs, files in os.walk(root, onerror=failed):
+                    dirs[:]=[d for d in dirs if not d.endswith('.app') and not Path(folder,d).is_symlink()]
+                    for name in sorted(files):
+                        source=Path(folder,name)
+                        if source.stem.casefold() in {n.casefold() for n in profile.get('exclude_names', [])}: continue
+                        if source.is_symlink() or source.suffix.lower() not in {'.lnk', '.url'}: continue
+                        if kind=='start' and re.search(r'(?i)uninstall|updat|recovery|repair|reporter|support|readme|help|documentation', source.stem): continue
+                        stat=source.stat()
+                        if time.time()-stat.st_mtime < 1: self.complete=False; continue
+                        cachekey=profile['id']+'|'+str(source)
+                        stamp=[stat.st_size, stat.st_mtime_ns]
+                        old=self.manifest.get('cache', {}).get(cachekey, {})
+                        try:
+                            metadata=old['metadata'] if old.get('stamp')==stamp else (url_metadata(source) if source.suffix.lower()=='.url' else self.inspect(source, profile))
+                            if not metadata.get('target'): self.complete=False; continue
+                            if kind=='start' and source.suffix.lower()=='.url' and metadata['target'].startswith(('http:', 'https:')): continue
+                            if kind=='start' and source.suffix.lower()=='.lnk' and not metadata['target'].lower().endswith(('.exe', '.com', '.bat', '.cmd', '.msi')): continue
+                            self.manifest.setdefault('cache', {})[cachekey]={'stamp':stamp, 'metadata':metadata}
+                            canonical={'prefix':profile['id'], 'target':metadata['target'].replace('/', '\\').casefold() if source.suffix.lower()=='.lnk' else metadata['target'], 'arguments':metadata.get('arguments',''), 'cwd':metadata.get('working_dir','').casefold()}
+                            ident=hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()[:20]
+                            found.append({'id':ident,'name':source.stem,'source':str(source),'kind':kind,'profile':profile,'metadata':metadata})
+                        except (OSError, ValueError, KeyError, RuntimeError, configparser.Error, subprocess.SubprocessError):
+                            self.complete=False
+                            print('shortcut temporarily unreadable; keeping existing launchers', flush=True)
+        found.sort(key=lambda item:(item['kind']!='desktop',len(item['name']),item['name'].casefold()))
+        ordered = {}
+        for item in found: ordered.setdefault(item['id'], item)
+        return ordered
+
+    @staticmethod
+    def owned(path, ident=None):
+        try:
+            if Path(path).is_symlink(): return False
+            obj=json.loads((Path(path)/'Contents/Resources/shortcut.json').read_text())
+            return obj.get('managed_by')==OWNER and (ident is None or obj.get('id')==ident)
+        except (OSError, ValueError): return False
+
+    def app_path(self, item):
+        previous=self.manifest['entries'].get(item['id'],{}).get('app')
+        if previous and Path(previous).parent==self.output and self.owned(previous,item['id']): return Path(previous)
+        name=safe_name(item['name']); bottle=safe_name(item['profile'].get('name',item['profile']['id']))
+        for suffix in ['', ' ('+bottle+')', ' ('+bottle+'-'+item['id'][:6]+')']:
+            path=self.output/(name+suffix+'.app')
+            if not path.exists() and not path.is_symlink() or self.owned(path,item['id']): return path
+        raise FileExistsError('launcher name collision')
+
+    def icon(self, item, destination):
+        fallback=Path(os.environ.get('PROGRAMS_ICON',str(Path(os.environ.get('PROGRAMS_SCRIPT_DIR','.'))/'app/merlot/AppIcon.icns')))
+        if fallback.is_file(): shutil.copy2(fallback,destination)
+        if sys.platform!='darwin': return
+        icon=host_path(item['metadata'].get('icon',''),item['profile'])
+        if icon is None or not icon.is_file(): icon=host_path(item['metadata']['target'],item['profile'])
+        if icon is None or not icon.is_file(): return
+        try:
+            with tempfile.TemporaryDirectory(dir=self.state) as temp:
+                temp=Path(temp);source=icon
+                if icon.suffix.lower() in {'.exe','.dll'}:
+                    source=temp/'source.ico';source.write_bytes(pe_icon(icon,item['metadata'].get('icon_index',0)))
+                if source.suffix.lower()=='.icns': shutil.copy2(source,destination);return
+                png=temp/'base.png'
+                subprocess.run(['/usr/bin/sips','-s','format','png',str(source),'--out',str(png)],check=True,capture_output=True,timeout=15)
+                iconset=temp/'AppIcon.iconset';iconset.mkdir()
+                for size in [16,32,128,256,512]:
+                    for scale in [1,2]:
+                        filename='icon_%dx%d%s.png'%(size,size,'@2x' if scale==2 else '')
+                        subprocess.run(['/usr/bin/sips','-z',str(size*scale),str(size*scale),str(png),'--out',str(iconset/filename)],check=True,capture_output=True,timeout=10)
+                subprocess.run(['/usr/bin/iconutil','-c','icns',str(iconset),'-o',str(destination)],check=True,capture_output=True,timeout=15)
+        except (OSError, ValueError, KeyError, IndexError, struct.error, subprocess.SubprocessError): pass
+
+    def build(self, item, app):
+        entry=self.config.get('entrypoint',os.environ.get('PROGRAMS_ENTRYPOINT',''))
+        descriptor={'managed_by':OWNER,**item}
+        descriptor.pop('kind',None)
+        content=json.dumps(descriptor,ensure_ascii=False,sort_keys=True)
+        existing=app/'Contents/Resources/shortcut.json'
+        if existing.is_file() and json.dumps(json.loads(existing.read_text()),ensure_ascii=False,sort_keys=True)==content: return False
+        self.output.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.wine-app-',dir=self.output) as temp:
+            stage=Path(temp)/app.name;mac=stage/'Contents/MacOS';resources=stage/'Contents/Resources';mac.mkdir(parents=True);resources.mkdir()
+            plist={'CFBundlePackageType':'APPL','CFBundleName':item['name'],'CFBundleDisplayName':item['name'],'CFBundleExecutable':'launch','CFBundleIdentifier':OWNER+'.app.'+item['id'],'CFBundleVersion':str(int(time.time())),'CFBundleIconFile':'AppIcon','NSHighResolutionCapable':True}
+            (stage/'Contents/Info.plist').write_bytes(plistlib.dumps(plist))
+            (resources/'shortcut.json').write_text(json.dumps(descriptor,ensure_ascii=False,indent=2)+'\n')
+            script='#!/bin/bash\nRESOURCE_DIR="$(cd -- "$(dirname -- "$0")/../Resources" && pwd)"\nexec /bin/bash '+shlex.quote(entry)+' --programs launch "$RESOURCE_DIR/shortcut.json"\n'
+            (mac/'launch').write_text(script);(mac/'launch').chmod(0o755)
+            self.icon(item,resources/'AppIcon.icns')
+            if app.exists():
+                if not self.owned(app,item['id']): raise FileExistsError('refusing to overwrite unmanaged app')
+                old=self.state/'Replaced'/str(uuid.uuid4())/app.name;old.parent.mkdir(parents=True);shutil.move(str(app),str(old))
+            shutil.move(str(stage),str(app))
+        if sys.platform=='darwin':
+            lsr='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
+            if Path(lsr).exists(): subprocess.run([lsr,'-f',str(app)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+        return True
+
+    def sync(self):
+        items=self.scan();self.output.mkdir(parents=True,exist_ok=True)
+        changed=0;new={}
+        for ident,item in items.items():
+            app=self.app_path(item);changed+=self.build(item,app);new[ident]={'app':str(app),'profile':item['profile']['id'],'source':item['source']}
+        for ident,old in self.manifest['entries'].items():
+            if ident in new: continue
+            if not self.complete: new[ident]=old;continue
+            app=Path(old['app'])
+            if app.parent==self.output and self.owned(app,ident):
+                retired=self.state/'Retired'/app.name;retired.parent.mkdir(exist_ok=True)
+                if retired.exists(): retired=retired.with_name(retired.stem+'-'+uuid.uuid4().hex[:6]+'.app')
+                shutil.move(str(app),str(retired));changed+=1
+        for ident,item in items.items():
+            if not item['profile'].get('prefer_plain_name'): continue
+            current=Path(new[ident]['app']);plain=self.output/(safe_name(item['name'])+'.app')
+            if current!=plain and not plain.exists() and not plain.is_symlink() and self.owned(current,ident):
+                shutil.move(str(current),str(plain));new[ident]['app']=str(plain);changed+=1
+        self.manifest['entries']=new
+        atomic_json(self.state/'manifest.json',self.manifest)
+        summary={'launchers':len(new),'changed':changed,'complete_scan':self.complete,'desktop':str(self.output),'checked_at':int(time.time())}
+        atomic_json(self.state/'status.json',summary)
+        if changed: print(json.dumps(summary),flush=True)
+        return summary
+
+
+def launch(descriptor):
+    item=json.loads(Path(descriptor).read_text())
+    if item.get('managed_by')!=OWNER: raise ValueError('not a managed launcher')
+    profile=item['profile'];metadata=item['metadata'];env=profile_env(profile)
+    root=Path(profile['path']);target=metadata['target'];name=item['name']
+    executable=target.replace('\\','/').rsplit('/',1)[-1].casefold()
+    target_rules={key.casefold():value for key,value in profile.get('target_overrides',{}).items()}
+    override=target_rules.get(executable) or profile.get('overrides',{}).get(name)
+    # A game/argument-bearing link is not the bare client launcher. Let Wine
+    # honor its original Windows command line instead of discarding arguments.
+    if metadata.get('arguments'): override=None
+    if override:
+        targets=list(root.glob(override['target_glob']))
+        if not targets: raise FileNotFoundError('configured application target is missing')
+        target_path=max(targets,key=lambda p:p.stat().st_mtime)
+        command=[profile['wine'],str(target_path)]+override.get('arguments',[])
+    elif profile.get('role')=='merlot' and not metadata.get('arguments') and (re.match(r'^steam://(?:run|rungameid)/[0-9]+',target) or target.replace('\\','/').lower().endswith('/steam.exe')):
+        match=re.match(r'^steam://(?:run|rungameid)/([0-9]+)',target)
+        if match: env['STEAM_GAME_ID']=match.group(1)
+        command=['/bin/bash',str(Path(profile.get('repo',str(HOME/'macos-wine-steam')))/'run.command')]
+    elif item['source'].lower().endswith('.url'):
+        command=[profile['wine'],'start',target]
+    else:
+        command=[profile['wine'],'start','/unix',item['source']]
+    cwd=host_path(metadata.get('working_dir',''),profile)
+    if cwd is None or not cwd.is_dir(): cwd=root
+    STATE.mkdir(parents=True,exist_ok=True)
+    with (STATE/('launch-'+item['id']+'.log')).open('ab') as output:
+        result=subprocess.run(command,env=env,cwd=str(cwd),stdout=output,stderr=subprocess.STDOUT)
+    atomic_json(STATE/('launch-'+item['id']+'.status.json'),{'exit_code':result.returncode,'checked_at':int(time.time())})
+    return result.returncode
+
+
+def install_watch(config, configure=True):
+    source=Path(os.environ['PROGRAMS_SCRIPT_DIR']);entry=Path(os.environ['PROGRAMS_ENTRYPOINT']);STATE.mkdir(parents=True,exist_ok=True)
+    gcc=shutil.which('x86_64-w64-mingw32-gcc') or '/opt/homebrew/bin/x86_64-w64-mingw32-gcc'
+    helper=STATE/'ShortcutInfo.exe'
+    subprocess.run([gcc,'-municode','-O2','-Wall',str(source/'app/merlot/ShortcutInfo.c'),'-o',str(helper),'-lole32','-lshell32','-luuid','-ladvapi32'],check=True)
+    if configure:
+        for profile in config['prefixes']:
+            result=subprocess.run([profile['wine'],str(helper),'--setup-desktop'],env=profile_env(profile),capture_output=True,text=True,timeout=30)
+            if result.returncode: raise RuntimeError('could not configure private Wine Desktop for '+profile['id'])
+            print('private Desktop import folder configured for '+profile['id'],flush=True)
+    app=AGENT;mac=app/'Contents/MacOS';resources=app/'Contents/Resources'
+    if app.exists():
+        info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
+        if info.get('CFBundleIdentifier')!=OWNER+'.agent': raise FileExistsError('agent app is not owned by this importer')
+    mac.mkdir(parents=True,exist_ok=True);resources.mkdir(parents=True,exist_ok=True)
+    env=dict(os.environ)
+    if Path('/Applications/Xcode.app/Contents/Developer').exists(): env['DEVELOPER_DIR']='/Applications/Xcode.app/Contents/Developer'
+    subprocess.run(['/usr/bin/clang','-fobjc-arc','-O2','-framework','Cocoa',str(source/'app/merlot/ShortcutAgent.m'),'-o',str(mac/'ShortcutAgent')],check=True,env=env)
+    shutil.copy2(entry,STATE/'entrypoint.command')
+    (resources/'entrypoint.command').write_text('#!/bin/bash\nexec /bin/bash \"$HOME/.cache/chardonnay-shortcuts/entrypoint.command\" \"$@\"\n')
+    (resources/'entrypoint.command').chmod(0o755)
+    shutil.copy2(helper,resources/'ShortcutInfo.exe');shutil.copy2(source/'app/merlot/AppIcon.icns',resources/'AppIcon.icns')
+    plist={'CFBundlePackageType':'APPL','CFBundleExecutable':'ShortcutAgent','CFBundleIdentifier':OWNER+'.agent','CFBundleName':'Wine Shortcuts','CFBundleDisplayName':'Wine Shortcuts','CFBundleVersion':'1','LSUIElement':True,'NSHighResolutionCapable':True,'NSDesktopFolderUsageDescription':'Create native app launchers when Windows programs create Desktop or Start Menu shortcuts.'}
+    (app/'Contents/Info.plist').write_bytes(plistlib.dumps(plist))
+    subprocess.run(['/usr/bin/codesign','--force','--sign','-',str(app)],check=True,capture_output=True)
+    agent=HOME/'Library/LaunchAgents'/(LABEL+'.plist');agent.parent.mkdir(parents=True,exist_ok=True)
+    agent.write_bytes(plistlib.dumps({'Label':LABEL,'ProgramArguments':['/usr/bin/open','-g','-W',str(app)],'RunAtLoad':True,'StartInterval':60,'LimitLoadToSessionType':'Aqua','StandardOutPath':str(STATE/'launchd.log'),'StandardErrorPath':str(STATE/'launchd.log')}))
+    domain='gui/'+str(os.getuid());subprocess.run(['/bin/launchctl','bootout',domain,str(agent)],capture_output=True)
+    subprocess.run(['/bin/launchctl','enable',domain+'/'+LABEL],check=True)
+    subprocess.run(['/bin/launchctl','bootstrap',domain,str(agent)],check=True)
+    subprocess.run(['/usr/bin/open','-g',str(app)],check=True)
+    print('watcher installed; allow Wine Shortcuts access to Desktop if macOS prompts',flush=True)
+
+
+def main(arguments):
+    action=arguments[0] if arguments else 'status'
+    if action=='launch': return launch(arguments[1])
+    if action=='status':
+        status=STATE/'status.json'
+        print(status.read_text() if status.exists() else 'No sync yet; start --programs watch and grant Desktop access.')
+        return 0
+    config=json.loads(CONFIG.read_text())
+    config['entrypoint']=os.environ.get('PROGRAMS_ENTRYPOINT',config.get('entrypoint',''))
+    if action=='watch': install_watch(config);return 0
+    if action=='unwatch':
+        agent=HOME/'Library/LaunchAgents'/(LABEL+'.plist')
+        subprocess.run(['/bin/launchctl','disable','gui/'+str(os.getuid())+'/'+LABEL],check=True)
+        subprocess.run(['/bin/launchctl','bootout','gui/'+str(os.getuid()),str(agent)],capture_output=True)
+        record=STATE/'worker.json'
+        if record.exists():
+            saved=json.loads(record.read_text());pid=int(saved['pid'])
+            actual=subprocess.run(['/bin/ps','-p',str(pid),'-o','lstart='],capture_output=True,text=True).stdout.strip()
+            if pid>1 and actual and actual==saved['started']: os.kill(pid,signal.SIGTERM)
+        print('watcher stopped; Desktop apps, import folders and configuration retained')
+        return 0
+    if action not in {'sync','daemon'}: raise ValueError('usage: --programs {sync|watch|status|unwatch}')
+    STATE.mkdir(parents=True,exist_ok=True)
+    with (STATE/'sync.lock').open('a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return 0
+        if action=='daemon':
+            started=subprocess.run(['/bin/ps','-p',str(os.getpid()),'-o','lstart='],capture_output=True,text=True).stdout.strip()
+            atomic_json(STATE/'worker.json',{'pid':os.getpid(),'started':started})
+            def stop(signum,frame): raise SystemExit(0)
+            signal.signal(signal.SIGTERM,stop)
+        importer=Importer(config)
+        while True:
+            try:
+                latest=json.loads(CONFIG.read_text())
+                latest['entrypoint']=os.environ.get('PROGRAMS_ENTRYPOINT',latest.get('entrypoint',''))
+                importer.config=latest
+                importer.sync()
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                atomic_json(STATE/'status.json',{'error':type(error).__name__,'desktop_permission_required':isinstance(error,PermissionError),'checked_at':int(time.time())})
+                print('shortcut sync blocked: '+type(error).__name__+'; existing apps retained',flush=True)
+                if action=='sync': return 1
+            if action=='sync': return 0
+            time.sleep(5)
+
+
+if __name__ == '__main__':
+    try: sys.exit(main(sys.argv[1:]))
+    except Exception as error:
+        print('shortcut importer: '+type(error).__name__+'; no application was auto-launched',file=sys.stderr)
+        sys.exit(1)
+# END PROGRAMS PYTHON
+PROGRAMS_PY
+}
+
 main() {
   local temp_root=""
   local output_dir=""
@@ -470,6 +882,12 @@ main() {
   echo "To create per-game launchers in ~/Applications/Merlot Games, run:"
   echo "  bash ${SCRIPT_DIR}/install_merlot.command --games sync"
 }
+
+if [[ "${1:-}" == "--programs" ]]; then
+  shift
+  programs_main "$@"
+  exit $?
+fi
 
 if [[ "${1:-}" == "--games" ]]; then
   shift
