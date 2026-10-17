@@ -1,0 +1,11 @@
+# Native Chardonnay manager — first usable increment
+
+Confirmed product target: CrossOver-style central app; Steam, EA and generic downloaded .exe/.msi installation workflows; guided defaults with advanced bottle controls; explicit protected backups; no forced shortcuts or silent game-payload copies.
+
+This increment builds an actual Cocoa manager and backend on the existing Mac stack, not a distributable engine package. It imports existing configured prefixes without migration, lists their installed clients/games/shortcuts, creates EMPTY owned isolated prefixes using existing tested engines, executes selected EXE/MSI installers in the GUI session, and exposes normal Steam/EA launch paths. Dedicated official-store download/dependency recipes are follow-up work, not implemented by this increment; fresh-store dependency/sign-in/game compatibility are separate verification gates. Existing authenticated clients/prefixes must not be reset to finish a test.
+
+Backend functionality remains embedded in install_merlot.command --bottles. Native source belongs in app/merlot/ChardonnayApp.m. Manager state is separate from prefixes; newly created bottles receive ownership markers, while imported environments remain externally managed. New-bottle registration may extend shortcut scope but must preserve the optional-shortcut policy; startup/import must not rewrite working configs or engine bindings.
+
+Test first: profile/engine import, no account/payload copying, unique empty bottle creation, engine/environment isolation, failed bootstrap state, EXE/MSI argument handling and imported-client routing. Native Mac acceptance uses private installer fixtures and a private GUI test bundle; test the actual Cocoa actions/backend/Wine path, not only mocked commands. No tests may migrate existing games or delete real user data.
+
+Ship a real ~/Applications/Chardonnay.app after isolated verification. Clearly distinguish tested native-manager/generic-installer paths from unverified fresh Steam/EA dependency/sign-in flows, universal Windows compatibility, engine distribution/upgrade and later UX features. Preserve all existing untracked work, both source trees and running shortcut/EA/Steam sessions. No commit/push without authorization.

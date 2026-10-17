@@ -925,6 +925,617 @@ if __name__ == '__main__':
 PROGRAMS_PY
 }
 
+bottles_main() {
+  export BOTTLES_ENTRYPOINT="${BOTTLES_ENTRYPOINT:-$SCRIPT_DIR/install_merlot.command}"
+  /usr/bin/python3 - "$@" <<'BOTTLES_PY'
+# BEGIN BOTTLES PYTHON
+"""Bottle/app manager. Existing prefixes are imported, never cloned or migrated."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import uuid
+
+BOTTLE_OWNER = 'local.chardonnay.bottles'
+ENTRYPOINT = Path(os.environ.get('BOTTLES_ENTRYPOINT', globals().get('__file__', 'install_merlot.command'))).absolute()
+DEFAULT_STATE = Path.home()/'Library/Application Support/Chardonnay'
+DEFAULT_CONFIG = Path.home()/'.config/chardonnay-shortcuts/config.json'
+
+
+def bottle_atomic_json(path, data):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if path.is_symlink(): raise ValueError('refusing_symlink_metadata')
+    temp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.new')
+    descriptor=os.open(str(temp),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(descriptor,'w',encoding='utf-8') as output:
+        json.dump(data,output,ensure_ascii=False,indent=2);output.write('\n');output.flush();os.fsync(output.fileno())
+    temp.replace(path)
+
+
+def bottle_read_json(path, fallback):
+    path=Path(path)
+    if not path.exists(): return fallback
+    if path.is_symlink() or path.stat().st_size>8*1024*1024: raise ValueError('unsafe_manager_metadata')
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+_SHARED={}
+def bottle_shared(section):
+    if section not in _SHARED:
+        text=ENTRYPOINT.read_text(encoding='utf-8')
+        body=text.split('# BEGIN '+section+' PYTHON\n',1)[1].split('# END '+section+' PYTHON',1)[0]
+        module=types.ModuleType('chardonnay_'+section.lower());module.__file__=str(ENTRYPOINT)
+        exec(compile(body,str(ENTRYPOINT),'exec'),module.__dict__);_SHARED[section]=module
+    return _SHARED[section]
+
+
+# Hashes and filenames are verified against the matching appwiz.cpl PE before use.
+# Keep prerequisite caches out of prefixes/source bundles; Wine installs the
+# matching architecture on demand when an actual HTML consumer needs it.
+GECKO_PINS={'2.47.4':{
+    'x86':'26cecc47706b091908f7f814bddb074c61beb8063318e9efc5a7f789857793d6',
+    'x86_64':'e590b7d988a32d6aa4cf1d8aa3aa3d33766fdd4cf4c89c2dcc2095ecb28d066f'}}
+
+
+def required_gecko_packages(row):
+    engine=Path(row['wine']).expanduser().parent.parent
+    packages=[]
+    for arch,pe_arch in [('x86','i386'),('x86_64','x86_64')]:
+        module=engine/'lib/wine'/(pe_arch+'-windows')/'appwiz.cpl'
+        if not module.is_file():continue
+        if module.stat().st_size>32*1024*1024:raise ValueError('oversized_appwiz_module')
+        data=module.read_bytes();matched=None
+        for version,pins in GECKO_PINS.items():
+            filename='wine-gecko-'+version+'-'+arch+'.msi'
+            if filename.encode('utf-16-le') in data and pins[arch].encode('ascii') in data:
+                matched={'version':version,'arch':arch,'filename':filename,'sha256':pins[arch],'url':'https://dl.winehq.org/wine/wine-gecko/'+version+'/'+filename};break
+        if matched is None:raise ValueError('unrecognized_gecko_requirement_for_bound_engine_'+arch)
+        packages.append(matched)
+    if not packages:raise ValueError('bound_engine_appwiz_module_unavailable')
+    return packages
+
+
+def download_gecko_package(url,destination):
+    curl='/usr/bin/curl' if Path('/usr/bin/curl').is_file() else shutil.which('curl')
+    if not curl:raise RuntimeError('curl_required_for_gecko_prerequisite')
+    result=subprocess.run([curl,'--fail','--silent','--show-error','--location','--proto','=https','--proto-redir','=https','--connect-timeout','15','--max-time','180','--max-filesize',str(80*1024*1024),'--output',str(destination),url],capture_output=True,text=True,timeout=190)
+    if result.returncode:raise RuntimeError('gecko_download_failed_no_package_published')
+
+
+def ensure_gecko_cache(row,cache_dir=None,downloader=None):
+    packages=required_gecko_packages(row)
+    cache=Path(cache_dir) if cache_dir is not None else Path.home()/'.cache/wine'
+    if cache.is_symlink():raise ValueError('symlink_gecko_cache')
+    cache.mkdir(parents=True,exist_ok=True,mode=0o700)
+    lockpath=cache/'.chardonnay-gecko.lock'
+    if lockpath.is_symlink():raise ValueError('symlink_gecko_lock')
+    downloaded=[]
+    def digest(path):
+        if path.stat().st_size>80*1024*1024:return None
+        checksum=hashlib.sha256()
+        with path.open('rb') as source:
+            for block in iter(lambda:source.read(1024*1024),b''):checksum.update(block)
+        return checksum.hexdigest()
+    with lockpath.open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        for package in packages:
+            target=cache/package['filename']
+            if target.is_symlink() or (target.exists() and not target.is_file()):raise ValueError('unsafe_gecko_package_target')
+            if target.is_file() and digest(target)==package['sha256']:continue
+            temporary=cache/(package['filename']+'.'+uuid.uuid4().hex+'.part')
+            try:
+                (downloader or download_gecko_package)(package['url'],temporary)
+                if temporary.is_symlink() or not temporary.is_file() or digest(temporary)!=package['sha256']:raise RuntimeError('gecko_package_hash_mismatch_no_package_published')
+                os.chmod(temporary,0o600)
+                if target.exists():target.rename(target.with_name(target.name+'.invalid-'+uuid.uuid4().hex))
+                temporary.replace(target);downloaded.append(package['arch'])
+            finally:
+                if temporary.is_file() and not temporary.is_symlink():temporary.unlink()
+    return {'ready':True,'downloaded':downloaded,'packages':[p['filename'] for p in packages],'cache_dir':str(cache),'existing_bottle_modified':False}
+
+
+# Native runtime inspection and explicit, snapshot-bound process control.
+# SPDX-License-Identifier: MIT
+import ctypes
+import signal
+
+
+class RuntimeBSDInfo(ctypes.Structure):
+    # Darwin sys/proc_info.h struct proc_bsdinfo; validate size and PID at runtime.
+    _fields_=[(n,ctypes.c_uint32) for n in ['flags','status','xstatus','pid','ppid','uid','gid','ruid','rgid','svuid','svgid','reserved']]+[('comm',ctypes.c_char*16),('name',ctypes.c_char*32)]+[(n,ctypes.c_uint32) for n in ['nfiles','pgid','jobc','tdev','tpgid']]+[('nice',ctypes.c_int32),('sec',ctypes.c_uint64),('usec',ctypes.c_uint64)]
+
+
+def runtime_native_identity(pid):
+    if sys.platform!='darwin':raise RuntimeError('runtime_controls_require_macos')
+    if not isinstance(pid,int) or pid<=1:raise ValueError('invalid_process_id')
+    library=ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
+    library.proc_pidinfo.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_uint64,ctypes.c_void_p,ctypes.c_int]
+    library.proc_pidinfo.restype=ctypes.c_int
+    library.proc_pidpath.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32];library.proc_pidpath.restype=ctypes.c_int
+    info=RuntimeBSDInfo();size=ctypes.sizeof(info)
+    result=library.proc_pidinfo(pid,3,0,ctypes.byref(info),size)
+    if not result and ctypes.get_errno()==3:return None  # ESRCH, not permission denial.
+    if size!=136 or result!=size or info.pid!=pid:raise RuntimeError('cannot_verify_native_process_identity')
+    if info.status==5:return None  # SZOMB; never signal a zombie.
+    path=ctypes.create_string_buffer(4096)
+    if library.proc_pidpath(pid,path,len(path))<=0:
+        # Recheck whether a short-lived process disappeared between the two calls.
+        again=RuntimeBSDInfo();result=library.proc_pidinfo(pid,3,0,ctypes.byref(again),size)
+        if not result and ctypes.get_errno()==3:return None
+        raise RuntimeError('cannot_read_native_process_path')
+    return {'pid':pid,'birth':[int(info.sec),int(info.usec)],'uid':int(info.uid),'native_path':os.fsdecode(path.value)}
+
+
+def runtime_is_wine(record):
+    return Path(record['native_path']).name.casefold() in {'wine','wine64','wine-preloader','wine64-preloader','wineserver'}
+
+
+def runtime_native_candidates():
+    result=subprocess.run(['/bin/ps','-axo','pid=,stat=,uid=,comm='],capture_output=True,text=True,timeout=10,check=True)
+    found={};warnings=[]
+    for line in result.stdout.splitlines():
+        parts=line.split(None,3)
+        if len(parts)!=4 or not parts[0].isdigit() or not parts[2].isdigit():continue
+        pid=int(parts[0])
+        if pid<=1 or int(parts[2])!=os.getuid() or 'Z' in parts[1]:continue
+        try:record=runtime_native_identity(pid)
+        except (OSError,RuntimeError):
+            if re.search(r'(?:\.exe$|wine|wineserver)',parts[3],re.I):warnings.append('uninspectable_wine_candidate')
+            continue
+        if record and record['uid']==os.getuid() and runtime_is_wine(record):
+            # No arguments, account names, environments or window titles in UI records.
+            record['name']=re.split(r'[/\\]',parts[3])[-1][:180]
+            found[pid]=record
+    return found,warnings
+
+
+def runtime_same_identity(a,b):
+    return bool(a and b and all(a.get(key)==b.get(key) for key in ['pid','birth','uid','native_path']))
+
+
+def runtime_native_snapshot():
+    if sys.platform!='darwin':raise RuntimeError('runtime_controls_require_macos')
+    candidates,warnings=runtime_native_candidates()
+    if len(candidates)>512:raise RuntimeError('too_many_wine_processes_for_safe_inspection')
+    if not candidates:return {'processes':[],'complete':not warnings,'warnings':warnings}
+    result=subprocess.run(['/usr/sbin/lsof','-nP','-a','-p',','.join(str(pid) for pid in sorted(candidates)),'-d','cwd,txt','-F0pn'],capture_output=True,timeout=15)
+    if result.returncode not in {0,1} or result.stderr.strip():warnings.append('runtime_file_inspection_failed')
+    if len(result.stdout)>32*1024*1024:raise RuntimeError('runtime_inspection_exceeds_bound')
+    pid=None;files={}
+    for token in result.stdout.split(b'\0'):
+        token=token.lstrip(b'\n')
+        if token.startswith(b'p') and token[1:].isdigit():pid=int(token[1:]);files.setdefault(pid,[])
+        elif token.startswith(b'n') and pid in candidates:files[pid].append(os.fsdecode(token[1:]))
+    after,new_warnings=runtime_native_candidates();warnings+=new_warnings
+    if set(after)-set(candidates):warnings.append('runtime_changed_during_inspection')
+    records=[]
+    for pid,record in candidates.items():
+        current=after.get(pid)
+        if not current:continue
+        if not runtime_same_identity(record,current):warnings.append('process_identity_changed');continue
+        if not files.get(pid):warnings.append('runtime_process_files_unavailable');continue
+        records.append({**record,'files':files[pid]})
+    return {'processes':records,'complete':not warnings,'warnings':sorted(set(warnings))}
+
+
+class BottleRuntime:
+    """Manual, consent-bound signals. Never probes or starts Wine for inspection."""
+    ACTIONS={'terminate','force-process','quit-all','force-all','restart','force-restart'}
+    def __init__(self,manager,inspector=None,identity=None,signaller=None,clock=None,sleeper=None):
+        self.manager=manager;self.inspector=inspector or runtime_native_snapshot
+        self.identity=identity or runtime_native_identity;self.signaller=signaller or os.kill
+        self.clock=clock or time.time;self.sleeper=sleeper or time.sleep
+
+    @staticmethod
+    def binding(row):
+        root=Path(row['path']).expanduser().resolve(strict=True);st=root.stat()
+        if not root.is_dir() or any(ord(c)<32 for c in str(root)):raise ValueError('unsafe_runtime_prefix')
+        wine=Path(row['wine']).expanduser().resolve(strict=True);engine=wine.stat()
+        return {'prefix':str(root),'device':st.st_dev,'inode':st.st_ino,'wine':str(wine),'wine_identity':[engine.st_dev,engine.st_ino,engine.st_size,engine.st_mtime_ns],'engine_id':row['engine_id']}
+
+    def inspect(self,row):
+        binding=self.binding(row);namespace='server-%x-%x'%(binding['device'],binding['inode'])
+        raw=self.inspector();complete=bool(raw.get('complete'));warnings=list(raw.get('warnings',[]));processes=[]
+        pattern=re.compile(r'^/(?:private/)?tmp/\.wine-'+str(os.getuid())+r'/(server-[0-9a-f]+-[0-9a-f]+)(?:/|$)')
+        for record in raw['processes']:
+            if record.get('uid')!=os.getuid() or not runtime_is_wine(record):continue
+            spaces={match.group(1) for path in record.get('files',[]) for match in [pattern.match(path)] if match}
+            if not spaces:
+                complete=False;warnings.append('wine_process_without_proven_prefix');continue
+            if namespace not in spaces:continue
+            if len(spaces)!=1:
+                complete=False;warnings.append('ambiguous_prefix_ownership');continue
+            value={key:record[key] for key in ['pid','birth','uid','native_path','name']}
+            value['server']=Path(value['native_path']).name=='wineserver';processes.append(value)
+        processes.sort(key=lambda p:p['pid'])
+        return {'bottle_id':row['id'],'binding':binding,'processes':processes,'complete':complete,'warnings':sorted(set(warnings)),'inspection_starts_wine':False}
+
+    def token_path(self,token):
+        if not isinstance(token,str) or not re.fullmatch(r'[0-9a-f]{32}',token):raise ValueError('invalid_runtime_snapshot')
+        return self.manager.state/'runtime'/('snapshot-'+token+'.json')
+
+    def snapshot(self,ident):
+        row=self.manager.get(ident);value=self.inspect(row);token=uuid.uuid4().hex
+        value.update({'token':token,'created_at':self.clock()})
+        parent=self.manager.state/'runtime'
+        if parent.is_symlink():raise ValueError('symlink_runtime_state')
+        parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        # Retain only a bounded number of recent private, unconsumed confirmations.
+        for path in parent.glob('snapshot-*.json'):
+            if path.is_symlink():raise ValueError('symlink_runtime_snapshot')
+            if path.is_file() and self.clock()-path.stat().st_mtime>300:path.unlink()
+        if len(list(parent.glob('snapshot-*.json')))>=128:raise RuntimeError('too_many_pending_runtime_snapshots')
+        bottle_atomic_json(self.token_path(token),value)
+        return value
+
+    def act(self,ident,token,action,pid=None,app_id=None,confirmed=False):
+        if not confirmed:raise ValueError('explicit_confirmation_required_unsaved_work_may_be_lost')
+        if action not in self.ACTIONS:raise ValueError('unknown_runtime_action')
+        # Coordinates manager runtime actions, launches and installers. This is not
+        # a lock over independent Steam/EA UI activity; the warning covers that.
+        with self.manager.runtime_lock():
+            row=self.manager.get(ident);saved=bottle_read_json(self.token_path(token),None)
+            if not saved or saved.get('bottle_id')!=ident:raise ValueError('unknown_or_consumed_runtime_snapshot')
+            age=self.clock()-saved['created_at']
+            if age<0 or age>180:raise ValueError('runtime_snapshot_expired_refresh_required')
+            if saved['binding']!=self.binding(row):raise ValueError('bottle_binding_changed_refresh_required')
+            current=self.inspect(row);whole=action in {'quit-all','force-all','restart','force-restart'}
+            if whole:
+                if not saved['complete'] or not current['complete']:raise ValueError('incomplete_runtime_inspection_no_bottle_wide_action')
+                if current['processes']!=saved['processes']:raise ValueError('runtime_changed_refresh_and_confirm_again')
+                targets=current['processes']
+            else:
+                if not isinstance(pid,int) or pid<=1:raise ValueError('invalid_process_id')
+                old=next((p for p in saved['processes'] if p['pid']==pid),None)
+                fresh=next((p for p in current['processes'] if p['pid']==pid),None)
+                if not old or old!=fresh:raise ValueError('selected_process_changed_refresh_required')
+                if fresh['server']:raise ValueError('server_requires_explicit_bottle_wide_action')
+                targets=[fresh]
+            if action in {'restart','force-restart'}:
+                item=next((a for a in self.manager.apps(row) if a['id']==app_id),None)
+                if item is None or item.get('kind') not in {'store','application','steam_game'}:raise ValueError('registered_application_required_for_restart')
+                if item.get('source') and any(word in item.get('name','').casefold() for word in ['uninstall','installer','setup','repair']):raise ValueError('installer_shortcut_cannot_be_replayed_as_restart')
+            # Preflight EVERY target before the first signal; repeat exact native
+            # birth identity immediately before each individual action as well.
+            for target in targets:
+                if not runtime_same_identity(target,self.identity(target['pid'])):raise ValueError('process_identity_changed_no_action')
+            self.token_path(token).unlink()  # consume consent even when later work fails
+            sig=signal.SIGKILL if action in {'force-process','force-all','force-restart'} else signal.SIGTERM
+            sent=[];changed=[]
+            # Clients before server. Native TERM is explicit termination, NOT a
+            # guarantee of a Windows save-dialog/WM_CLOSE handshake.
+            for target in sorted(targets,key=lambda p:p['server']):
+                fresh=self.identity(target['pid'])
+                if fresh is None:continue
+                if not runtime_same_identity(target,fresh):changed.append(target['pid']);continue
+                try:self.signaller(target['pid'],sig);sent.append(target['pid'])
+                except ProcessLookupError:pass
+            attempts=0
+            while True:
+                remaining=[p['pid'] for p in targets if runtime_same_identity(p,self.identity(p['pid']))]
+                if not remaining or attempts>=25:break
+                self.sleeper(0.2);attempts+=1
+            post=self.inspect(row) if whole else None
+            stopped=not remaining and not changed and (not whole or (post['complete'] and not post['processes']))
+            result={'bottle_id':ident,'action':action,'signalled':sent,'remaining':remaining,'identity_changed':changed,'stopped':stopped,'force_required':not stopped and sig!=signal.SIGKILL,'launch_dispatched':False,'automatic_escalation':False}
+            if action in {'restart','force-restart'} and stopped:
+                # Reuse the existing configured launch route; never persist a
+                # list of old commands or replay an install/uninstall operation.
+                if self.binding(self.manager.get(ident))!=saved['binding']:raise ValueError('binding_changed_after_stop_no_relaunch')
+                result.update(self.manager.launch(ident,app_id,_runtime_locked=True))
+            bottle_atomic_json(self.manager.state/'runtime'/'last-action.json',{**result,'checked_at':self.clock()})
+            return result
+
+
+class BottleManager:
+    def __init__(self, config_path=DEFAULT_CONFIG, state_dir=DEFAULT_STATE, runner=None):
+        self.config_path=Path(config_path).expanduser();self.state=Path(state_dir).expanduser()
+        self.runner=runner
+        if self.state.is_symlink(): raise ValueError('symlink_manager_state')
+
+    def source_config(self):
+        config=bottle_read_json(self.config_path,{'version':1,'prefixes':[]})
+        if not isinstance(config,dict) or not isinstance(config.get('prefixes'),list): raise ValueError('invalid_shortcut_config')
+        return config
+
+    def registry(self):
+        value=bottle_read_json(self.state/'bottles.json',{'version':1,'managed_by':BOTTLE_OWNER,'bottles':[]})
+        if value.get('version')!=1 or value.get('managed_by')!=BOTTLE_OWNER or not isinstance(value.get('bottles'),list): raise ValueError('invalid_bottle_registry')
+        return value
+
+    @contextlib.contextmanager
+    def lock(self):
+        self.state.mkdir(parents=True,exist_ok=True,mode=0o700)
+        path=self.state/'manager.lock'
+        if path.is_symlink(): raise ValueError('symlink_manager_lock')
+        with path.open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX);yield
+
+    @contextlib.contextmanager
+    def runtime_lock(self):
+        self.state.mkdir(parents=True,exist_ok=True,mode=0o700)
+        path=self.state/'runtime-actions.lock'
+        if path.is_symlink():raise ValueError('symlink_runtime_lock')
+        with path.open('a') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:raise RuntimeError('another_manager_runtime_operation_is_running')
+            yield
+
+    @staticmethod
+    def engine_for(profile):
+        wine=str(Path(profile['wine']).expanduser())
+        environment={str(k):str(v) for k,v in profile.get('environment',{}).items()}
+        ident='engine-'+hashlib.sha256(json.dumps([wine,environment],sort_keys=True).encode()).hexdigest()[:12]
+        backend='D3DMetal' if environment.get('CX_ACTIVE_GRAPHICS_BACKEND')=='d3dmetal' else 'DXMT' if environment.get('DXMT_VERSION') else 'Configured Wine'
+        version=environment.get('WINE_VERSION','')
+        return {'id':ident,'name':('Wine '+version+' · '+backend).strip() if version else backend,'wine':wine,'environment':environment,'available':os.access(wine,os.X_OK)}
+
+    def bindings(self):
+        registry=self.registry();owned={str(Path(b['path']).resolve()):b for b in registry['bottles']}
+        bottles=[];engines={};seen=set()
+        for profile in self.source_config()['prefixes']:
+            if not all(isinstance(profile.get(k),str) and profile[k] for k in ['id','path','wine']): raise ValueError('invalid_prefix_binding')
+            key=str(Path(profile['path']).expanduser().resolve())
+            if key in seen or key in owned: continue
+            seen.add(key);engine=self.engine_for(profile);engines.setdefault(engine['id'],engine)
+            ident='existing-'+hashlib.sha256(key.encode()).hexdigest()[:12]
+            bottles.append({**profile,'id':ident,'source_profile_id':profile['id'],'engine_id':engine['id'],'external':True,'phase':'ready' if (Path(key)/'drive_c').is_dir() else 'unavailable','name':profile.get('name',profile['id'])})
+        for stored in registry['bottles']:
+            engine=self.engine_for(stored);engines.setdefault(engine['id'],engine)
+            bottles.append({**stored,'external':False})
+        return bottles,list(engines.values())
+
+    def get(self, ident):
+        rows,_=self.bindings()
+        row=next((x for x in rows if x['id']==ident),None)
+        if row is None: raise ValueError('unknown_bottle')
+        if row.get('phase')!='ready': raise ValueError('bottle_not_ready')
+        if not os.access(row['wine'],os.X_OK): raise ValueError('bound_engine_unavailable')
+        return row
+
+    @staticmethod
+    def environment(row):
+        # Do not inherit another launcher's engine, prefix, app ID or LS identity.
+        env={key:os.environ[key] for key in ['HOME','USER','LOGNAME','TMPDIR','LANG','LC_ALL','DEVELOPER_DIR'] if key in os.environ}
+        env['PATH']='/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        env.update({str(k):str(v) for k,v in row.get('environment',{}).items()})
+        for key in ['WINELOADER','WINESERVER','SteamAppId','SteamGameId','__CFBundleIdentifier','RESOURCEPATH']:env.pop(key,None)
+        env.update({'WINEPREFIX':row['path'],'WINEDEBUG':'-all','WINEDLLPATH':''})
+        return env
+
+    def execute(self,row,command,wait=True,cwd=None):
+        directory=self.state/'logs';directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        logfile=directory/(row['id']+'.log')
+        if logfile.is_symlink(): raise ValueError('symlink_operation_log')
+        fd=os.open(str(logfile),os.O_WRONLY|os.O_APPEND|os.O_CREAT,0o600)
+        with os.fdopen(fd,'ab') as output:
+            kwargs={'env':self.environment(row),'cwd':str(cwd or row['path']),'stdin':subprocess.DEVNULL,'stdout':output,'stderr':subprocess.STDOUT}
+            if self.runner: return self.runner(command,**kwargs)
+            if wait:return subprocess.run(command,**kwargs)
+            return subprocess.Popen(command,start_new_session=True,**kwargs)
+
+    def create(self,name,engine_id):
+        if not isinstance(name,str) or not name.strip() or len(name)>120 or any(ord(c)<32 for c in name):raise ValueError('invalid_bottle_name')
+        with self.lock():
+            _,engines=self.bindings();engine=next((e for e in engines if e['id']==engine_id and e['available']),None)
+            if engine is None:raise ValueError('unknown_or_unavailable_engine')
+            ident=uuid.uuid4().hex;parent=self.state/'bottles';parent.mkdir(exist_ok=True,mode=0o700)
+            if parent.is_symlink():raise ValueError('symlink_bottle_root')
+            prefix=parent/ident;prefix.mkdir(mode=0o700)
+            row={'id':ident,'name':name.strip(),'path':str(prefix),'wine':engine['wine'],'environment':engine['environment'],'engine_id':engine_id,'phase':'creating','managed_by':BOTTLE_OWNER,'source_profile_id':'chardonnay-'+ident,'created_at':int(time.time())}
+            bottle_atomic_json(prefix/'.chardonnay-bottle.json',{'managed_by':BOTTLE_OWNER,'id':ident})
+            ledger=self.registry();ledger['bottles'].append(row);bottle_atomic_json(self.state/'bottles.json',ledger)
+        try:
+            result=self.execute(row,[row['wine'],'wineboot','--init'])
+            if result.returncode or not (prefix/'drive_c').is_dir():raise RuntimeError('wine_initialization_failed')
+            helper=Path(os.environ.get('PROGRAMS_HELPER',str(Path.home()/'.cache/chardonnay-shortcuts/ShortcutInfo.exe')))
+            if helper.is_file():
+                result=self.execute(row,[row['wine'],str(helper),'--setup-desktop'])
+                if result.returncode:raise RuntimeError('private_desktop_setup_failed')
+            elif self.runner is None:raise RuntimeError('private_desktop_helper_required_before_installing_apps')
+            # Only the new EMPTY prefix is configured. Existing sessions are untouched.
+            result=self.execute(row,[row['wine'],'reg','add',r'HKCU\Software\Wine','/v','Version','/d','win10','/f'])
+            if result.returncode:raise RuntimeError('windows_version_setup_failed')
+            with self.lock():
+                config=self.source_config();profile={k:row[k] for k in ['name','path','wine','environment']};profile['id']=row['source_profile_id']
+                if not any(p.get('path')==row['path'] for p in config['prefixes']):config['prefixes'].append(profile);bottle_atomic_json(self.config_path,config)
+                ledger=self.registry();stored=next(b for b in ledger['bottles'] if b['id']==ident);stored['phase']='ready';row['phase']='ready';bottle_atomic_json(self.state/'bottles.json',ledger)
+            return row
+        except Exception:
+            with self.lock():
+                ledger=self.registry();next(b for b in ledger['bottles'] if b['id']==ident)['phase']='failed';bottle_atomic_json(self.state/'bottles.json',ledger)
+            raise
+
+    def links(self,row,inspect=False):
+        shared=bottle_shared('PROGRAMS');profile={**row,'id':row.get('source_profile_id',row['id'])}
+        cache_dir=self.state/'shortcut-cache';cache=shared.Importer({'prefixes':[profile]},cache_dir)
+        old=bottle_read_json(Path.home()/'.cache/chardonnay-shortcuts/manifest.json',{'cache':{}})
+        cache.manifest['cache']={**old.get('cache',{}),**cache.manifest.get('cache',{})}
+        def inspector(path,binding):
+            if not inspect:raise RuntimeError('uncached_link_requires_explicit_refresh')
+            return shared.inspect_link(path,binding)
+        cache.inspect=inspector
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):items=cache.scan()
+        except (OSError,ValueError,RuntimeError):return []
+        self.last_scan_complete=cache.complete
+        # This only persists metadata, never generates or deletes Desktop apps.
+        bottle_atomic_json(cache_dir/'manifest.json',cache.manifest)
+        result=[]
+        for item in items.values():
+            target=item['metadata'].get('target','')
+            if target.lower().replace('\\','/').endswith(('/steam.exe','/ealauncher.exe','/eadesktop.exe')) or target.startswith('steam://'):continue
+            if not target.lower().endswith(('.exe','.com','.cmd','.bat')):continue
+            result.append({'id':'link-'+item['id'],'name':item['name'],'kind':'application','source':item['source'],'metadata':item['metadata']})
+        return result
+
+    def apps(self,row,inspect=False):
+        if row.get('phase')!='ready':return []
+        root=Path(row['path']);apps=[]
+        steam=root/'drive_c/Program Files (x86)/Steam/steam.exe'
+        if steam.is_file():
+            apps.append({'id':'steam','name':'Steam','kind':'store','target':str(steam)})
+            storage=bottle_shared('STORAGE')
+            try:
+                for library in storage.library_roots(row):
+                    for manifest in sorted((library/'steamapps').glob('appmanifest_*.acf')):
+                        data=storage.read_vdf(manifest)['AppState'];appid=storage.valid_appid(data['appid'])
+                        if appid=='228980':continue  # shared runtime, not a playable application
+                        if int(data.get('StateFlags','0')) & 4:apps.append({'id':'steam-'+appid,'name':data.get('name',appid),'kind':'steam_game','appid':appid})
+            except (OSError,ValueError,KeyError,TypeError):pass
+        ea=root/'drive_c/Program Files/Electronic Arts/EA Desktop'
+        if list(ea.glob('*/EA Desktop/EADesktop.exe')) or (ea/'EA Desktop/EADesktop.exe').is_file():apps.append({'id':'ea','name':'EA','kind':'store'})
+        apps+=self.links(row,inspect)
+        return apps
+
+    def status(self):
+        bottles,engines=self.bindings()
+        return {'version':1,'bottles':[{**b,'apps':self.apps(b)} for b in bottles],'engines':engines,'state_dir':str(self.state),'engine_distribution_included':False}
+
+    def install_file(self,ident,path,quiet=False):
+        with self.runtime_lock():return self._install_file(ident,path,quiet)
+
+    def _install_file(self,ident,path,quiet=False):
+        row=self.get(ident);path=Path(path).expanduser().absolute()
+        if not path.is_file() or path.suffix.lower() not in {'.exe','.msi'}:raise ValueError('choose_an_existing_exe_or_msi')
+        if self.runner is None:ensure_gecko_cache(row)
+        if path.suffix.lower()=='.msi':
+            command=[row['wine'],'msiexec','/i','Z:'+str(path).replace('/','\\')]
+            if quiet:command+=['/qn','/norestart']
+        else:command=[row['wine'],str(path)]
+        result=self.execute(row,command,cwd=path.parent)
+        if result.returncode not in {0,3010}:raise RuntimeError('installer_exited_'+str(result.returncode)+'_see_private_bottle_log')
+        if self.runner is None:
+            for attempt in range(5):
+                self.links(row,inspect=True)
+                if getattr(self,'last_scan_complete',False):break
+                if attempt<4:time.sleep(0.3)
+        return {'bottle_id':ident,'installer_process_finished':True,'exit_code':result.returncode,'reboot_required':result.returncode==3010}
+
+    def ea_target(self,row):
+        root=Path(row['path']).resolve();base=root/'drive_c/Program Files/Electronic Arts/EA Desktop'
+        candidates=list(base.glob('*/EA Desktop/EADesktop.exe'))
+        canonical=base/'EA Desktop/EADesktop.exe'
+        if canonical.is_file():candidates.append(canonical)
+        if not candidates:raise ValueError('ea_client_not_installed')
+        # Reuse the executable actually mapped by this prefix's authenticated EA.
+        if sys.platform=='darwin':
+            ps=subprocess.run(['/bin/ps','-axo','pid=,comm='],capture_output=True,text=True,timeout=10,check=True)
+            for line in ps.stdout.splitlines():
+                fields=line.strip().split(None,1)
+                if len(fields)!=2 or not fields[0].isdigit() or not fields[1].lower().endswith('eadesktop.exe'):continue
+                files=subprocess.run(['/usr/sbin/lsof','-nP','-a','-p',fields[0],'-d','cwd,txt','-Fn'],capture_output=True,text=True,timeout=10)
+                names={line[1:] for line in files.stdout.splitlines() if line.startswith('n')}
+                for candidate in candidates:
+                    if str(candidate) in names:return candidate
+        if canonical.is_file():return canonical
+        def version(path):return tuple(int(x) for x in re.findall(r'\d+',path.parent.parent.name))
+        return max(candidates,key=version)
+
+    def launch(self,ident,app_id,_runtime_locked=False):
+        if _runtime_locked:return self._launch(ident,app_id)
+        with self.runtime_lock():return self._launch(ident,app_id)
+
+    def _launch(self,ident,app_id):
+        row=self.get(ident);apps=self.apps(row);item=next((a for a in apps if a['id']==app_id),None)
+        if item is None:raise ValueError('application_not_found')
+        cwd=Path(row['path']);launch_row=dict(row)
+        if app_id=='steam' or item['kind']=='steam_game':
+            if row.get('role')=='merlot':
+                launch_row['environment']=dict(row.get('environment',{}))
+                if item['kind']=='steam_game':launch_row['environment']['STEAM_GAME_ID']=item['appid']
+                command=['/bin/bash',str(Path(row.get('repo',str(Path.home()/'macos-wine-steam')))/'run.command')]
+            else:
+                steam=Path(row['path'])/'drive_c/Program Files (x86)/Steam/steam.exe'
+                command=[row['wine'],str(steam),'-noverifyfiles','-no-cef-sandbox','-cef-single-process']
+                if item['kind']=='steam_game':command+=['-applaunch',item['appid']]
+        elif app_id=='ea':command=[row['wine'],str(self.ea_target(row)),'--in-process-gpu','--no-sandbox']
+        else:
+            source=Path(item['source'])
+            if not source.is_file():raise ValueError('shortcut_source_unavailable')
+            command=[row['wine'],'start','/unix',str(source)]
+            proposed=bottle_shared('PROGRAMS').host_path(item['metadata'].get('working_dir',''),row)
+            if proposed and proposed.is_dir():cwd=proposed
+        result=self.execute(launch_row,command,wait=False,cwd=cwd)
+        return {'launch_dispatched':True,'bottle_id':ident,'app_id':app_id,'pid':getattr(result,'pid',None)}
+
+    def uninstaller(self,ident):
+        with self.runtime_lock():return self._uninstaller(ident)
+
+    def _uninstaller(self,ident):
+        row=self.get(ident)
+        if self.runner is None:ensure_gecko_cache(row)
+        self.execute(row,[row['wine'],'uninstaller'],wait=False)
+        return {'uninstaller_dispatched':True}
+
+
+def bottle_install_manager(destination):
+    if sys.platform!='darwin':raise RuntimeError('native_manager_requires_macos')
+    source=ENTRYPOINT.parent/'app/merlot/ChardonnayApp.m';destination=Path(destination).expanduser().absolute()
+    if destination.suffix!='.app' or destination.exists():raise ValueError('choose_a_new_app_destination')
+    if not source.is_file():raise ValueError('native_manager_source_missing')
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='chardonnay-build-',dir=str(destination.parent)) as temporary:
+        staged=Path(temporary)/destination.name;mac=staged/'Contents/MacOS';resources=staged/'Contents/Resources';mac.mkdir(parents=True);resources.mkdir()
+        env=dict(os.environ);env['DEVELOPER_DIR']='/Applications/Xcode.app/Contents/Developer'
+        subprocess.run(['/usr/bin/clang','-fobjc-arc','-Wall','-Wextra','-Werror','-framework','Cocoa','-framework','CoreGraphics','-framework','ScreenCaptureKit',str(source),'-o',str(mac/'Chardonnay')],env=env,check=True,capture_output=True,text=True)
+        icon=ENTRYPOINT.parent/'app/merlot/AppIcon.icns'
+        if icon.is_file():shutil.copy2(icon,resources/'AppIcon.icns')
+        info={'CFBundleIdentifier':'local.chardonnay.manager','CFBundleName':'Chardonnay','CFBundleDisplayName':'Chardonnay','CFBundleExecutable':'Chardonnay','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.1.1','CFBundleVersion':'2','NSHighResolutionCapable':True,'LSMinimumSystemVersion':'14.0','ChardonnayEntrypoint':str(ENTRYPOINT)}
+        if icon.is_file():info['CFBundleIconFile']='AppIcon.icns'
+        (staged/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        subprocess.run(['/usr/bin/codesign','--force','--sign','-','--identifier','local.chardonnay.manager',str(staged)],check=True,capture_output=True,text=True)
+        subprocess.run(['/usr/bin/codesign','--verify','--strict',str(staged)],check=True,capture_output=True,text=True)
+        staged.rename(destination)
+    return {'app':str(destination),'signature_verified':True,'development_engine_bindings':True}
+
+
+def bottles_cli(arguments):
+    parser=argparse.ArgumentParser(description='Chardonnay bottle/app manager; no implicit prefix copies or migrations')
+    parser.add_argument('action',choices=['status','create','install-file','launch','uninstaller','ensure-gecko','install-manager','processes','runtime-action'])
+    parser.add_argument('--config',default=str(DEFAULT_CONFIG));parser.add_argument('--state-dir',default=str(DEFAULT_STATE))
+    parser.add_argument('--name');parser.add_argument('--engine');parser.add_argument('--bottle');parser.add_argument('--file');parser.add_argument('--app')
+    parser.add_argument('--quiet',action='store_true');parser.add_argument('--destination',default=str(Path.home()/'Applications/Chardonnay.app'))
+    parser.add_argument('--snapshot');parser.add_argument('--operation',choices=sorted(BottleRuntime.ACTIONS));parser.add_argument('--pid',type=int);parser.add_argument('--yes',action='store_true',help='explicit consent: unsaved work or installer state may be lost')
+    args=parser.parse_args(arguments);manager=BottleManager(args.config,args.state_dir)
+    if args.action=='status':result=manager.status()
+    elif args.action=='create':result=manager.create(args.name,args.engine)
+    elif args.action=='install-file':result=manager.install_file(args.bottle,args.file,quiet=args.quiet)
+    elif args.action=='launch':result=manager.launch(args.bottle,args.app)
+    elif args.action=='uninstaller':result=manager.uninstaller(args.bottle)
+    elif args.action=='ensure-gecko':result=ensure_gecko_cache(manager.get(args.bottle))
+    elif args.action=='processes':result=BottleRuntime(manager).snapshot(args.bottle)
+    elif args.action=='runtime-action':result=BottleRuntime(manager).act(args.bottle,args.snapshot,args.operation,pid=args.pid,app_id=args.app,confirmed=args.yes)
+    else:result=bottle_install_manager(args.destination)
+    print(json.dumps(result,ensure_ascii=False));return 0
+
+
+if __name__=='__main__':
+    try:sys.exit(bottles_cli(sys.argv[1:]))
+    except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as error:
+        print(json.dumps({'error':str(error) if isinstance(error,(ValueError,RuntimeError)) else type(error).__name__}),file=sys.stderr);sys.exit(2)
+# END BOTTLES PYTHON
+BOTTLES_PY
+}
+
+if [[ "${1:-}" == "--bottles" ]]; then
+  shift
+  bottles_main "$@"
+  exit $?
+fi
+
 storage_main() {
   export STORAGE_ENTRYPOINT="${STORAGE_ENTRYPOINT:-$SCRIPT_DIR/install_merlot.command}"
   /usr/bin/python3 - "$@" <<'STORAGE_PY'
