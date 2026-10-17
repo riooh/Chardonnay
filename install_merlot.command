@@ -10,6 +10,84 @@ DEFAULT_ICON_PATH="${SCRIPT_DIR}/app/merlot/AppIcon.icns"
 LAUNCHER_TEMPLATE="${TEMPLATE_DIR}/MerlotLauncher"
 LAUNCHER_NAME="MerlotLauncher"
 
+# Source-only Wine integration; never downloads/replaces an engine implicitly.
+if [[ "${1:-}" == "--mac-shortcuts" ]]; then
+  shift
+  /usr/bin/python3 - "$SCRIPT_DIR" "$@" <<'MAC_SHORTCUTS_PY'
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+root=Path(sys.argv[1])
+parser=argparse.ArgumentParser(description='Patch matching Wine source with native macOS menu defaults; build/deploy separately')
+parser.add_argument('--source',required=True)
+parser.add_argument('--test-probe',action='store_true',help='stage diagnostic header; disabled unless explicitly compiled with CHARDONNAY_SHORTCUT_TESTING')
+args=parser.parse_args(sys.argv[2:])
+try:
+    driver=Path(args.source).expanduser().resolve()/'dlls/winemac.drv'
+    source=driver/'cocoa_app.m'
+    if source.is_symlink() or not source.is_file():raise ValueError('expected_regular_winemac_cocoa_source')
+    text=source.read_text()
+    include='#include "chardonnay_shortcuts.h"\n\n'
+    marker='@implementation WineApplicationController'
+    hook='            chardonnayConfigureMacShortcuts(mainMenu, submenu);\n'
+    target='            [NSApp setMainMenu:mainMenu];'
+    if text.count(marker)!=1 or text.count(target)!=1:raise ValueError('unrecognized_wine_menu_source')
+    if include not in text and 'chardonnay_shortcuts.h' in text:raise ValueError('conflicting_shortcut_include')
+    if hook not in text and 'chardonnayConfigureMacShortcuts' in text:raise ValueError('conflicting_shortcut_hook')
+    replacement=text
+    if include not in replacement:replacement=replacement.replace(marker,include+marker,1)
+    if hook not in replacement:replacement=replacement.replace(target,hook+target,1)
+    header=(root/'app/merlot/WineMacShortcuts.h').read_bytes()
+    window=driver/'cocoa_window.m'
+    if window.is_symlink() or not window.is_file():raise ValueError('expected_regular_winemac_window_source')
+    window_text=window.read_text()
+    window_marker='static inline NSUInteger adjusted_modifiers_for_settings(NSUInteger modifiers)'
+    event_marker='    - (void) postKeyEvent:(NSEvent *)theEvent\n    {\n'
+    edit_include='#include "chardonnay_edit_shortcuts.h"\n\n'
+    edit_hook='        theEvent = chardonnayMacEditEvent(theEvent);\n'
+    if window_text.count(window_marker)!=1 or window_text.count(event_marker)!=1:raise ValueError('unrecognized_wine_keyboard_source')
+    if edit_include not in window_text and 'chardonnay_edit_shortcuts.h' in window_text:raise ValueError('conflicting_edit_include')
+    if edit_hook not in window_text and 'chardonnayMacEditEvent' in window_text:raise ValueError('conflicting_edit_hook')
+    window_replacement=window_text
+    if edit_include not in window_replacement:window_replacement=window_replacement.replace(window_marker,edit_include+window_marker,1)
+    if edit_hook not in window_replacement:window_replacement=window_replacement.replace(event_marker,event_marker+edit_hook,1)
+    files=[(driver/'chardonnay_shortcuts.h',header),(driver/'chardonnay_edit_shortcuts.h',(root/'app/merlot/WineMacEditShortcuts.h').read_bytes())]
+    if args.test_probe:files.append((driver/'WineMacShortcutProbe.h',(root/'tests/fixtures/WineMacShortcutProbe.h').read_bytes()))
+    # All validation precedes writes; refuse symlink targets rather than following them.
+    for destination,data in files:
+        if destination.is_symlink():raise ValueError('refusing_symlink_header')
+    backups=[]
+    for original,old,new in [(source,text,replacement),(window,window_text,window_replacement)]:
+        if new==old:continue
+        backup=original.with_name(original.name+'.before-chardonnay-'+hashlib.sha256(old.encode()).hexdigest()[:16])
+        if backup.is_symlink() or (backup.exists() and backup.read_text()!=old):raise ValueError('source_backup_conflict')
+        if not backup.exists():backups.append((backup,old))
+    for backup,old in backups:
+        with backup.open('x') as output:output.write(old)
+    files.extend([(source,replacement.encode()),(window,window_replacement.encode())])
+    changed=[]
+    for destination,data in files:
+        if destination.exists() and destination.read_bytes()==data:continue
+        mode=destination.stat().st_mode&0o777 if destination.exists() else 0o644
+        fd,temporary=tempfile.mkstemp(prefix='.chardonnay-',dir=driver)
+        try:
+            with os.fdopen(fd,'wb') as output:output.write(data)
+            os.chmod(temporary,mode);os.replace(temporary,destination)
+        finally:
+            if os.path.exists(temporary):os.unlink(temporary)
+        changed.append(str(destination))
+    print(json.dumps({'source':str(source),'changed':changed,'native_shortcuts':['command-q','command-m','command-h','command-w','control-command-f'],'engine_deployed':False,'test_probe_compile_time_only':args.test_probe}))
+except (OSError,ValueError) as error:
+    print(json.dumps({'error':str(error)}),file=sys.stderr);sys.exit(2)
+MAC_SHORTCUTS_PY
+  exit $?
+fi
+
 # --games mode: per-game launcher settings
 GAMES_WINE_PREFIX="${GAMES_WINE_PREFIX:-$HOME/.wine-steam-11}"
 GAMES_DIR="${GAMES_DIR:-$HOME/Applications/Merlot Games}"
